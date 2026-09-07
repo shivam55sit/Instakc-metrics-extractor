@@ -55,7 +55,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-def extract_eye_scans(pdf_bytes: bytes, dpi: int = 200):
+def extract_eye_scans(pdf_bytes: bytes, dpi: int = 400):
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
         tmp.write(pdf_bytes)
         tmp_path = tmp.name
@@ -74,23 +74,22 @@ def extract_eye_scans(pdf_bytes: bytes, dpi: int = 200):
     # Slight blur to reduce noise and connect adjacent pixels
     gray = cv2.GaussianBlur(gray, (7, 7), 0)
     
-    # Inverse binary threshold: Dark scans become white blobs on black background
-    # Since the background is white, gray value is ~255.
-    # The image panels are dark grey/black.
-    # A threshold of 230 inverted means everything < 230 becomes 255 (white), everything >= 230 becomes 0 (black).
-    # This perfectly isolated the panels on a stark black background.
     _, thresh = cv2.threshold(gray, 230, 255, cv2.THRESH_BINARY_INV)
     
     # Use RETR_LIST to find all contours (in case images are inside another bounding box)
     contours, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     
     bounding_boxes = []
+    
+    # Scale expected area by DPI. (base is 200 DPI)
+    scale_factor = (dpi / 200.0) ** 2
+    min_area = 50000 * scale_factor
+    max_area = 800000 * scale_factor
+    
     for cnt in contours:
         x, y, w, h = cv2.boundingRect(cnt)
         area = w * h
-        # The image panels are large blocks. 
-        # Filter out small text noise and huge page borders.
-        if 50000 < area < 800000 and 0.5 < w/h < 1.5:
+        if min_area < area < max_area and 0.5 < w/h < 1.5:
             bounding_boxes.append((x, y, w, h))
             
     # Sort by area descending and take the top 6
@@ -113,7 +112,34 @@ def extract_eye_scans(pdf_bytes: bytes, dpi: int = 200):
     
     def crop_img(bbox):
         x, y, w, h = bbox
-        return Image.fromarray(page_img[y:y+h, x:x+w])
+        panel = page_img[y:y+h, x:x+w]
+        
+        # Find the colored heatmap to crop tightly
+        hsv = cv2.cvtColor(panel, cv2.COLOR_RGB2HSV)
+        s = hsv[:, :, 1]
+        
+        # Grey background has near-zero saturation. Colored heatmap has high saturation.
+        _, color_mask = cv2.threshold(s, 20, 255, cv2.THRESH_BINARY)
+        
+        contours, _ = cv2.findContours(color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if contours:
+            # Get the bounding box that encompasses all colored regions
+            all_points = np.vstack(contours)
+            cx, cy, cw, ch = cv2.boundingRect(all_points)
+            
+            # Add a tiny padding margin (2% of the panel width)
+            pad = int(w * 0.02)
+            cx1 = max(0, cx - pad)
+            cy1 = max(0, cy - pad)
+            cx2 = min(w, cx + cw + pad)
+            cy2 = min(h, cy + ch + pad)
+            
+            final_cropped = panel[cy1:cy2, cx1:cx2]
+            return Image.fromarray(final_cropped)
+        
+        # Fallback if no color detected (shouldn't happen)
+        return Image.fromarray(panel)
         
     left_eye_imgs = [crop_img(b) for b in top_row]
     right_eye_imgs = [crop_img(b) for b in bottom_row]
