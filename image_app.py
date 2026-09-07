@@ -55,7 +55,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-def extract_eye_scans(pdf_bytes: bytes, dpi: int = 400):
+def extract_eye_scans(pdf_bytes: bytes, dpi: int = 600):
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
         tmp.write(pdf_bytes)
         tmp_path = tmp.name
@@ -136,7 +136,38 @@ def extract_eye_scans(pdf_bytes: bytes, dpi: int = 400):
             cy2 = min(h, cy + ch + pad)
             
             final_cropped = panel[cy1:cy2, cx1:cx2]
-            return Image.fromarray(final_cropped)
+            
+            # --- Morphological Artifact Removal ---
+            gray = cv2.cvtColor(final_cropped, cv2.COLOR_RGB2GRAY)
+            
+            # Kernel size scaled by DPI for line thickness
+            # At 400 DPI, lines/text are roughly 3-6 pixels thick, so kernel of ~11 is good.
+            k_size = max(5, int(11 * (dpi / 400)))
+            if k_size % 2 == 0: k_size += 1
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+            
+            # 1. Black-Hat for thin black lines
+            # Closing removes small dark features, subtracting original reveals them
+            closed = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
+            black_hat = cv2.subtract(closed, gray)
+            _, mask_black = cv2.threshold(black_hat, 20, 255, cv2.THRESH_BINARY)
+            
+            # 2. Top-Hat for thin white text and crosshairs
+            # Opening removes small bright features, subtracting from original reveals them
+            opened = cv2.morphologyEx(gray, cv2.MORPH_OPEN, kernel)
+            top_hat = cv2.subtract(gray, opened)
+            _, mask_white = cv2.threshold(top_hat, 20, 255, cv2.THRESH_BINARY)
+            
+            defect_mask = cv2.bitwise_or(mask_black, mask_white)
+            
+            # Slight dilation to cover the anti-aliased borders of the artifacts
+            dilate_kernel = np.ones((3,3), np.uint8)
+            defect_mask = cv2.dilate(defect_mask, dilate_kernel, iterations=1)
+            
+            # Telea Inpainting to fill the masked artifacts with surrounding colors
+            final_cleaned = cv2.inpaint(final_cropped, defect_mask, 3, cv2.INPAINT_TELEA)
+            
+            return Image.fromarray(final_cleaned)
         
         # Fallback if no color detected (shouldn't happen)
         return Image.fromarray(panel)
